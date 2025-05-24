@@ -70,30 +70,39 @@ io.on("connection", (socket) => {
     socket.roomId = roomId;
     socket.userName = user.name;
 
-    // Thông báo cho người dùng mới về danh sách người dùng hiện tại
-    socket.emit("users-in-room", room.users);
+    // Gửi danh sách user hiện tại cho user mới
+    socket.emit(
+      "existing-users",
+      room.users.filter((u) => u.id !== socket.id)
+    );
 
-    // Thông báo cho các người dùng khác về người mới
+    // Thông báo cho các user khác về user mới
     socket.to(roomId).emit("user-joined", user);
 
-    console.log(`${user.name} joined room ${roomId}`);
+    console.log(
+      `${user.name} joined room ${roomId}. Total users: ${room.users.length}`
+    );
   });
 
-  // WebRTC signaling
+  // WebRTC signaling - nhận offer và forward đến target
   socket.on("offer", (data) => {
+    console.log(`Offer from ${socket.id} to ${data.target}`);
     socket.to(data.target).emit("offer", {
       offer: data.offer,
       caller: socket.id,
     });
   });
 
+  // WebRTC signaling - nhận answer và forward đến target
   socket.on("answer", (data) => {
+    console.log(`Answer from ${socket.id} to ${data.target}`);
     socket.to(data.target).emit("answer", {
       answer: data.answer,
       answerer: socket.id,
     });
   });
 
+  // WebRTC signaling - nhận ice candidate và forward
   socket.on("ice-candidate", (data) => {
     socket.to(data.target).emit("ice-candidate", {
       candidate: data.candidate,
@@ -109,9 +118,14 @@ io.on("connection", (socket) => {
         room.users = room.users.filter((user) => user.id !== socket.id);
         socket.to(socket.roomId).emit("user-left", socket.id);
 
+        console.log(
+          `${socket.userName} left room ${socket.roomId}. Remaining: ${room.users.length}`
+        );
+
         // Xóa phòng nếu không còn ai
         if (room.users.length === 0) {
           rooms.delete(socket.roomId);
+          console.log(`Room ${socket.roomId} deleted`);
         }
       }
     }
