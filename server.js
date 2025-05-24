@@ -12,6 +12,9 @@ const io = socketIo(server, {
   },
   pingTimeout: 60000,
   pingInterval: 25000,
+  // Thêm cấu hình để hỗ trợ kết nối qua các mạng khác nhau
+  transports: ["websocket", "polling"],
+  allowEIO3: true,
 });
 
 app.use(cors());
@@ -20,7 +23,7 @@ app.use(express.json());
 // Serve static files if needed
 app.use(express.static("public"));
 
-// Lưu trữ thông tin phòng
+// Lưu trữ thông tin phòng với thêm metadata
 const rooms = new Map();
 
 // Generate room ID
@@ -35,6 +38,9 @@ app.post("/api/create-room", (req, res) => {
     id: roomId,
     users: [],
     createdAt: new Date(),
+    // Thêm thống kê kết nối
+    connectionAttempts: 0,
+    successfulConnections: 0,
   });
 
   console.log(`Room created: ${roomId}`);
@@ -47,10 +53,28 @@ app.get("/api/room/:roomId", (req, res) => {
   const room = rooms.get(roomId);
 
   if (room) {
-    res.json({ exists: true, userCount: room.users.length });
+    res.json({
+      exists: true,
+      userCount: room.users.length,
+      users: room.users.map((u) => ({ id: u.id, name: u.name })),
+    });
   } else {
     res.json({ exists: false });
   }
+});
+
+// API để lấy thông tin debug
+app.get("/api/debug/rooms", (req, res) => {
+  const roomsInfo = Array.from(rooms.entries()).map(([id, room]) => ({
+    id,
+    userCount: room.users.length,
+    users: room.users.map((u) => ({ name: u.name, joinedAt: u.joinedAt })),
+    createdAt: room.createdAt,
+    connectionAttempts: room.connectionAttempts,
+    successfulConnections: room.successfulConnections,
+  }));
+
+  res.json({ rooms: roomsInfo, totalRooms: rooms.size });
 });
 
 // Clean up empty rooms periodically
@@ -68,7 +92,7 @@ setInterval(() => {
 }, 300000); // Check every 5 minutes
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  console.log(`User connected: ${socket.id} from ${socket.handshake.address}`);
 
   // Join room
   socket.on("join-room", (data) => {
@@ -80,26 +104,63 @@ io.on("connection", (socket) => {
     }
 
     const room = rooms.get(roomId);
-    const user = {
-      id: socket.id,
-      name: userName || `User${room.users.length + 1}`,
-      joinedAt: new Date(),
-    };
 
-    room.users.push(user);
+    // Kiểm tra xem user đã tồn tại chưa (reconnection)
+    const existingUserIndex = room.users.findIndex((u) => u.id === socket.id);
+    if (existingUserIndex !== -1) {
+      room.users[existingUserIndex].name =
+        userName || room.users[existingUserIndex].name;
+      console.log(`User ${socket.id} reconnected to room ${roomId}`);
+    } else {
+      const user = {
+        id: socket.id,
+        name: userName || `User${room.users.length + 1}`,
+        joinedAt: new Date(),
+        // Thêm thông tin kết nối
+        address: socket.handshake.address,
+        userAgent: socket.handshake.headers["user-agent"],
+      };
+
+      room.users.push(user);
+      room.connectionAttempts++;
+    }
+
     socket.join(roomId);
     socket.roomId = roomId;
-    socket.userName = user.name;
+    socket.userName = room.users.find((u) => u.id === socket.id)?.name;
 
     console.log(
-      `${user.name} (${socket.id}) joined room ${roomId}. Total users: ${room.users.length}`
+      `${socket.userName} (${socket.id}) joined room ${roomId}. Total users: ${room.users.length}`
     );
 
-    // Thông báo cho các user khác về user mới (chỉ những user đã có trước đó sẽ tạo offer)
+    // Gửi thông tin phòng cho user mới
+    socket.emit("room-joined", {
+      roomId,
+      users: room.users
+        .filter((u) => u.id !== socket.id)
+        .map((u) => ({ id: u.id, name: u.name })),
+    });
+
+    // Thông báo cho các user khác về user mới
     socket.to(roomId).emit("user-joined", {
       id: socket.id,
-      name: user.name,
+      name: socket.userName,
     });
+  });
+
+  // Thêm event để track connection status
+  socket.on("connection-status", (data) => {
+    const { roomId, status, targetUserId } = data;
+    console.log(
+      `Connection status in room ${roomId}: ${status} between ${socket.id} and ${targetUserId}`
+    );
+
+    if (rooms.has(roomId)) {
+      const room = rooms.get(roomId);
+      if (status === "connected") {
+        room.successfulConnections++;
+      }
+    }
   });
 
   // Leave room explicitly
@@ -109,11 +170,11 @@ io.on("connection", (socket) => {
     }
   });
 
-  // WebRTC signaling - nhận offer và forward đến target
+  // WebRTC signaling với enhanced logging
   socket.on("offer", (data) => {
-    console.log(`Forwarding offer from ${socket.id} to ${data.target}`);
+    const logMsg = `Offer: ${socket.id} -> ${data.target} in room ${socket.roomId}`;
+    console.log(logMsg);
 
-    // Validate target exists in same room
     if (socket.roomId) {
       const room = rooms.get(socket.roomId);
       const targetUser = room?.users.find((u) => u.id === data.target);
@@ -125,17 +186,17 @@ io.on("connection", (socket) => {
         });
       } else {
         console.log(
-          `Target user ${data.target} not found in room ${socket.roomId}`
+          `❌ Target user ${data.target} not found in room ${socket.roomId}`
         );
+        socket.emit("error", `Target user not found: ${data.target}`);
       }
     }
   });
 
-  // WebRTC signaling - nhận answer và forward đến target
   socket.on("answer", (data) => {
-    console.log(`Forwarding answer from ${socket.id} to ${data.target}`);
+    const logMsg = `Answer: ${socket.id} -> ${data.target} in room ${socket.roomId}`;
+    console.log(logMsg);
 
-    // Validate target exists in same room
     if (socket.roomId) {
       const room = rooms.get(socket.roomId);
       const targetUser = room?.users.find((u) => u.id === data.target);
@@ -147,17 +208,19 @@ io.on("connection", (socket) => {
         });
       } else {
         console.log(
-          `Target user ${data.target} not found in room ${socket.roomId}`
+          `❌ Target user ${data.target} not found in room ${socket.roomId}`
         );
+        socket.emit("error", `Target user not found: ${data.target}`);
       }
     }
   });
 
-  // WebRTC signaling - nhận ice candidate và forward
   socket.on("ice-candidate", (data) => {
-    console.log(`Forwarding ICE candidate from ${socket.id} to ${data.target}`);
+    const candidateType = data.candidate?.type || "unknown";
+    console.log(
+      `ICE candidate (${candidateType}): ${socket.id} -> ${data.target}`
+    );
 
-    // Validate target exists in same room
     if (socket.roomId) {
       const room = rooms.get(socket.roomId);
       const targetUser = room?.users.find((u) => u.id === data.target);
@@ -169,7 +232,7 @@ io.on("connection", (socket) => {
         });
       } else {
         console.log(
-          `Target user ${data.target} not found in room ${socket.roomId}`
+          `❌ Target user ${data.target} not found for ICE candidate`
         );
       }
     }
@@ -211,16 +274,32 @@ io.on("connection", (socket) => {
   }
 });
 
-// Error handling
+// Error handling với enhanced logging
 io.engine.on("connection_error", (err) => {
-  console.log("Connection error:", err.req);
+  console.log("❌ Connection error details:");
+  console.log("Request:", err.req?.url);
   console.log("Error code:", err.code);
   console.log("Error message:", err.message);
   console.log("Error context:", err.context);
 });
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    timestamp: new Date().toISOString(),
+    activeRooms: rooms.size,
+    totalUsers: Array.from(rooms.values()).reduce(
+      (sum, room) => sum + room.users.length,
+      0
+    ),
+  });
+});
+
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Access the app at http://localhost:${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📱 Access the app at http://localhost:${PORT}`);
+  console.log(`🏥 Health check at http://localhost:${PORT}/health`);
+  console.log(`🔍 Debug info at http://localhost:${PORT}/api/debug/rooms`);
 });
